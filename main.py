@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from torch.utils.data import Subset, DataLoader, TensorDataset, ConcatDataset
+from torch.utils.data import Subset, DataLoader, TensorDataset, ConcatDataset, SubsetRandomSampler, RandomSampler
+
 
 import torchvision
 import torchvision.transforms as transforms
@@ -16,6 +17,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, f1_score, recall_score, accuracy_score
+from collections import OrderedDict
 
 from dataset import build_poisoned_training_set, build_testset
 import resnet
@@ -175,6 +177,10 @@ parser.add_argument('--poisoning_rate', type=float, default=0.1, help='poisoning
 parser.add_argument('--trigger_label', type=int, default=1, help='The NO. of trigger label (int, range from 0 to 10, default: 0)')
 parser.add_argument('--trigger_path', default="./trigger_10.png", help='Trigger Path (default: ./triggers/trigger_white.png)')
 parser.add_argument('--trigger_size', type=int, default=3, help='Trigger Size (int, default: 5)')
+
+# load local model2
+parser.add_argument('--loadlocal', type=bool, default=True, help='load the local model2')
+parser.add_argument('--local_modelname', type=str, default="model2_poison_0.1_best.pth", help='model2 name')
 
 args = parser.parse_args()
 
@@ -463,42 +469,104 @@ def visualize_poisoned_images(poison_dataset, num_images=5):
     plt.show()
 
 
-
-
-
-
-if __name__ == "__main__":
-    # main()
+def loadlocal():
+    computing_device = args.device
     
-    computing_device = "cuda"
+    trainset_clean, dataset_train_poisoned = build_poisoned_training_set(is_train=True, args=args)
+    trainloader_clean  = DataLoader(trainset_clean,         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     
     dataset_val_clean, dataset_val_poisoned = build_testset(is_train=False, args=args)
+    trainloader_poison = DataLoader(dataset_train_poisoned, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     valloader_clean    = DataLoader(dataset_val_clean,      batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     valloader_poison   = DataLoader(dataset_val_poisoned,   batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     
-    # local model
-    model2 = get_resnet18().to(computing_device)
+    sample_size = 500
+    subset_indices = np.random.choice(len(trainset_clean), sample_size, replace=False)
+    sampler = SubsetRandomSampler(subset_indices)   # 使用 SubsetRandomSampler 进行采样
+    trainset_clean_sample = torch.utils.data.DataLoader(trainset_clean, batch_size=128, sampler=sampler, shuffle=False)
     
-    loss_fn = nn.CrossEntropyLoss()
-    
-    # 加载多卡模型时移除 'module.' 前缀
-    state_dict = torch.load('model2_poison_0.1_best.pth')
-    optimizer = state_dict["optimizer_state_dict"]
-    from collections import OrderedDict
+    num_sample = 0
+    for batch in trainset_clean_sample:
+        num_sample += len(batch[0])
+    print(f"trainset_clean_sample size {num_sample}")
 
+
+
+    # load local model2
+    state_dict = torch.load(args.local_modelname)
     
-    new_state_dict = OrderedDict()  # 去除 'module.' 前缀
-    for k, v in state_dict["model_state_dict"].items():
-        name = k.replace('module.', '')  # 去掉 'module.'
-        new_state_dict[name] = v
-    model2.load_state_dict(new_state_dict)  # 加载修改后的模型参数
+    model2 = get_resnet18().to(computing_device)
+    if torch.cuda.device_count() > 1:
+        model2 = nn.DataParallel(model2)
+    # new_state_dict = OrderedDict()  # 去除 'module.' 前缀
+    # for k, v in state_dict["model_state_dict"].items():
+    #     name = k.replace('module.', '')  # 去掉 'module.'
+    #     new_state_dict[name] = v
     
-    # for i in range(10):
-    #     clean_loss, clean_acc = val(model2, loss_fn, valloader_clean, computing_device)
-    #     poison_loss, poison_acc = val(model2, loss_fn, valloader_poison, computing_device)
+    # model2.load_state_dict(new_state_dict)  # 加载修改后的模型参数
     
-    #     print(clean_loss, clean_acc)
-    #     print(poison_loss, poison_acc)
-    #     print()
+    model2.load_state_dict(state_dict['model_state_dict'])
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer2 = state_dict["optimizer_state_dict"]
     
+    
+    clean_loss_2, clean_acc_2 = val(model2, loss_fn, valloader_clean, computing_device)
+    poison_loss_2, poison_acc_2 = val(model2, loss_fn, valloader_poison, computing_device)
+    print(f"model2, VALIDATE | BEFORE | clean_loss {clean_loss_2:.3f}, clean_acc {clean_acc_2:.3f} | poison_loss {poison_loss_2:.3f}, poison_acc {poison_acc_2:.3f}")
+    
+    # 在model2的基础上，在sample正常数据集上训练model1
+    model1 = copy.deepcopy(model2)
+    optimizer1 = torch.optim.SGD(model1.parameters(), lr=0.01, momentum=0.9, weight_decay=0.005)
+    
+    for epoch in range(10):
+        trainloss = train(model1, loss_fn, optimizer1, trainset_clean_sample, computing_device)
+        cossim = model_cossim(model1, model2)
+        
+        print(f"epoch {epoch} | trainloss {trainloss} | cossim {cossim}")
+    
+    
+    # 最后看一下偏移量最大的层
+    model12_layer_cossim = layer_cossim(model1, model2)
+    model12_layer_cossim = sorted(model12_layer_cossim, key=lambda x: x[1])   
+    model12_layer_cossim = [cossim for cossim in model12_layer_cossim if cossim[0].find(".weight") >= 1]
+    for cossim in model12_layer_cossim:
+        print(cossim)
+    
+    
+    # 把偏移量最大的k层替换回model2
+    layer_k = 4
+    changed_layer = []
+    for i in range(layer_k):
+        layer_name = model12_layer_cossim[i][0]
+        changed_layer.append(layer_name)
+        
+        # layer_name.replace(".weight", "")
+        
+        
+        t2 = model2.state_dict()[layer_name]
+        t1 = model1.state_dict()[layer_name]
+        
+        lda = 0
+
+        p = t2 - t1 # 异常信息
+        tmp = t2 - 0.2 * p
+        
+        model2.state_dict()[layer_name].copy_(p)
+    
+    print(changed_layer)
+    
+    
+    
+    clean_loss_2, clean_acc_2 = val(model2, loss_fn, valloader_clean, computing_device)
+    poison_loss_2, poison_acc_2 = val(model2, loss_fn, valloader_poison, computing_device)
+    print(f"model2, VALIDATE | AFTER | clean_loss {clean_loss_2:.3f}, clean_acc {clean_acc_2:.3f} | poison_loss {poison_loss_2:.3f}, poison_acc {poison_acc_2:.3f}")
+    
+    
+
+if __name__ == "__main__":
+
+    if args.loadlocal:
+        loadlocal()
+    else:
+        main()
     
